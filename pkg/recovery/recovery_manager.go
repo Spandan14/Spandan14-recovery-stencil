@@ -303,6 +303,15 @@ func (rm *RecoveryManager) Recover() error {
 		}
 	}
 
+	// // if there are active transactions, find the old operations past the checkpoint as well and add them in 
+	for i := 0; i < startIndex; i++ {
+		if el, ok := logs[i].(editLog); ok {
+			if _, ok := activeTxs[el.id]; ok {
+				activeTxs[el.id] = append([]editLog{el}, activeTxs[el.id]...)
+			}
+		}
+	}
+
 	for uuid, txEditLogs := range activeTxs {
 		for i := len(txEditLogs) - 1; i >= 0; i-- {
 			err := rm.undo(txEditLogs[i])

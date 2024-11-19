@@ -395,7 +395,7 @@ func testMultiInsertCheckpointing(t *testing.T) {
 	for i := int64(0); i < numEntries; i++ {
 		checkFindFails(t, db, tm, clientId, tableName, i)
 	}
-}
+} 
 
 func testMultiInsertCommitDeleteCheckpointing(t *testing.T) {
 	db, tm, rm, clientId := setupRecovery(t, "")
