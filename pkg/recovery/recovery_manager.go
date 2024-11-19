@@ -84,21 +84,62 @@ func (rm *RecoveryManager) Table(tblType string, tblName string) error {
 func (rm *RecoveryManager) Edit(clientId uuid.UUID, table database.Index, action action, key int64, oldval int64, newval int64) error {
 	rm.mtx.Lock()
 	defer rm.mtx.Unlock()
-	panic("Not implemented")
+
+	el := editLog{
+		id:        clientId,
+		tablename: table.GetName(),
+		action:    action,
+		key:       key,
+		oldval:    oldval,
+		newval:    newval,
+	}
+
+	err := rm.flushLog(el)
+	if err != nil {
+		return fmt.Errorf("error writing an Edit log: %w", err)
+	}
+
+	// if _, ok := rm.tm.GetTransaction(clientId); !ok {
+	// 	return errors.New("transaction not started")
+	// }
+
+	rm.txStack[clientId] = append(rm.txStack[clientId], el)
+
+	return nil
 }
 
 // Start records the start of a transaction to the write-ahead log.
 func (rm *RecoveryManager) Start(clientId uuid.UUID) error {
 	rm.mtx.Lock()
 	defer rm.mtx.Unlock()
-	panic("Not implemented")
+
+	err := rm.flushLog(startLog{id: clientId})
+	if err != nil {
+		return fmt.Errorf("error writing a Start log: %w", err)
+	}
+
+	// if _, ok := rm.txStack[clientId]; ok {
+	// 	return errors.New("transaction already started")
+	// }
+
+	rm.txStack[clientId] = make([]editLog, 0)
+
+	return nil
 }
 
 // Commit records the committing of a transaction to the write-ahead log.
 func (rm *RecoveryManager) Commit(clientId uuid.UUID) error {
 	rm.mtx.Lock()
 	defer rm.mtx.Unlock()
-	panic("Not implemented")
+
+	err := rm.flushLog(commitLog{id: clientId})
+
+	if err != nil {
+		return fmt.Errorf("error writing a Commit log: %w", err)
+	}
+
+	delete(rm.txStack, clientId)
+	return nil
 }
 
 // Checkpoint flushes all pages to disk and creates a checkpoint to recover the database
@@ -107,7 +148,24 @@ func (rm *RecoveryManager) Commit(clientId uuid.UUID) error {
 func (rm *RecoveryManager) Checkpoint() error {
 	rm.mtx.Lock()
 	defer rm.mtx.Unlock()
-	panic("Not implemented")
+
+	for _, table := range rm.db.GetTables() {
+		// table.GetPager().LockAllPages()
+		table.GetPager().FlushAllPages()
+		// table.GetPager().UnlockAllPages()
+	}
+
+	// copy keys to not edit during map
+	txIDs := make([]uuid.UUID, 0, len(rm.txStack))
+	for id := range rm.txStack {
+		txIDs = append(txIDs, id)
+	}
+
+	err := rm.flushLog(checkpointLog{ids: txIDs})
+	if err != nil {
+		return fmt.Errorf("error writing a Checkpoint log: %w", err) 
+	}
+
 	rm.delta() // Keep this line at the end that ensures checkpointing works correctly!
 	return nil
 }
@@ -189,13 +247,100 @@ func (rm *RecoveryManager) undo(log editLog) error {
 // Recover carries out a full recovery to the most recent checkpoint according to
 // the write-ahead log. Intended to be used on startup after a crash.
 func (rm *RecoveryManager) Recover() error {
-	panic("Not implemented")
+	logs, chkptIndex, err := rm.readLogs()
+	if err != nil {
+		return err
+	}
+
+	activeTxs := make(map[uuid.UUID][]editLog)
+
+	startIndex := chkptIndex
+	if chkptIndex == len(logs) {
+		startIndex = 0
+	}
+
+	for i := startIndex; i < len(logs); i++ {
+		if tl, ok := logs[i].(tableLog); ok {
+			_, err := rm.db.CreateTable(tl.tblName, database.IndexType(tl.tblType))
+			if err != nil {
+				return err
+			}
+		} else if el, ok := logs[i].(editLog); ok {
+			err := rm.redo(el)
+			if err != nil {
+				return err
+			}
+
+			activeTxs[el.id] = append(activeTxs[el.id], el)
+		} else if sl, ok := logs[i].(startLog); ok {
+			err := rm.tm.Begin(sl.id)
+			if err != nil {
+				return err
+			}
+
+			activeTxs[sl.id] = make([]editLog, 0)
+		} else if cl, ok := logs[i].(commitLog); ok {
+			err := rm.tm.Commit(cl.id)
+			if err != nil {
+				return err
+			}
+
+			delete(activeTxs, cl.id)
+		} else if cl, ok := logs[i].(checkpointLog); ok {
+			// if there are transactions that are still up and running here that we don't have we need to add
+			for _, uuid := range cl.ids {
+				if _, ok := activeTxs[uuid]; !ok {
+					err := rm.tm.Begin(uuid)
+					if err != nil {
+						return err
+					}
+
+					activeTxs[uuid] = make([]editLog, 0)
+				}
+			}
+		} else {
+			return errors.New("unknown log type")
+		}
+	}
+
+	for uuid, txEditLogs := range activeTxs {
+		for i := len(txEditLogs) - 1; i >= 0; i-- {
+			err := rm.undo(txEditLogs[i])
+			if err != nil {
+				return err
+			}
+		}
+
+		err := rm.tm.Commit(uuid)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // Rollback rolls back the current uncommitted transaction for a client.
 // This is called when you abort a transaction.
 func (rm *RecoveryManager) Rollback(clientId uuid.UUID) error {
-	panic("Not implemented")
+	for i := len(rm.txStack[clientId]) - 1; i >= 0; i-- {
+		err := rm.undo(rm.txStack[clientId][i])
+		if err != nil {
+			return err
+		}
+	}
+
+	err := rm.Commit(clientId)
+	if err != nil {
+		return err
+	}
+
+	err = rm.tm.Commit(clientId)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // Primes the database for recovery
